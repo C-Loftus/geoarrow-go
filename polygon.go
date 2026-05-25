@@ -3,7 +3,6 @@ package geoarrow
 import (
 	"fmt"
 	"reflect"
-	"strconv"
 	"strings"
 
 	json "github.com/goccy/go-json"
@@ -21,10 +20,14 @@ type PolygonValue struct {
 	dim   Dimension
 }
 
+// NewPolygonValue returns a polygon of the given dimension whose rings are
+// flat interleaved coord slices (each of length n_vertices * dim.NDim()).
+// The first ring is the exterior boundary; any remaining rings are holes.
 func NewPolygonValue(dim Dimension, rings [][]float64) PolygonValue {
 	return PolygonValue{rings: rings, dim: dim}
 }
 
+// NumRings returns the number of rings in v (0 for an empty polygon).
 func (v PolygonValue) NumRings() int {
 	return len(v.rings)
 }
@@ -39,10 +42,13 @@ func (v PolygonValue) NumVertices(i int) int {
 	return len(v.rings[i]) / v.dim.NDim()
 }
 
+// Dimension returns the coordinate dimension of v.
 func (v PolygonValue) Dimension() Dimension {
 	return v.dim
 }
 
+// GeometryType returns the GeoArrow GeometryTypeID for v (PolygonID,
+// PolygonZID, PolygonMID, or PolygonZMID).
 func (v PolygonValue) GeometryType() GeometryTypeID {
 	switch v.dim {
 	case XY:
@@ -54,62 +60,47 @@ func (v PolygonValue) GeometryType() GeometryTypeID {
 	case XYZM:
 		return PolygonZMID
 	default:
+		// Unreachable: v.dim is set by NewPolygonValue or by a validated
+		// storage type.
 		panic("invalid coordinate dimension for PolygonValue")
 	}
 }
 
+// IsEmpty reports whether v has no rings.
 func (v PolygonValue) IsEmpty() bool {
 	return len(v.rings) == 0
 }
 
+// String renders v as WKT (e.g. "POLYGON((0 0, 1 0, 0 1, 0 0))").
 func (v PolygonValue) String() string {
 	if v.IsEmpty() {
 		return "POLYGON EMPTY"
 	}
 
-	b := strings.Builder{}
+	var b strings.Builder
 	b.WriteString("POLYGON")
-	switch v.dim {
-	case XYZ:
-		b.WriteString(" Z")
-	case XYM:
-		b.WriteString(" M")
-	case XYZM:
-		b.WriteString(" ZM")
-	}
-	b.WriteString("(")
-
+	b.WriteString(dimSuffix(v.dim))
+	b.WriteByte('(')
 	stride := v.dim.NDim()
 	for i, ring := range v.rings {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString("(")
-		nVerts := len(ring) / stride
-		for vi := 0; vi < nVerts; vi++ {
-			if vi > 0 {
-				b.WriteString(", ")
-			}
-			for d := 0; d < stride; d++ {
-				if d > 0 {
-					b.WriteString(" ")
-				}
-				b.WriteString(strconv.FormatFloat(ring[vi*stride+d], 'f', 6, 64))
-			}
-		}
-		b.WriteString(")")
+		formatCoordRing(&b, ring, stride)
 	}
-	b.WriteString(")")
+	b.WriteByte(')')
 	return b.String()
 }
 
+// MarshalJSON encodes v as a JSON array of rings, each ring a JSON array of
+// coordinate arrays.
 func (v PolygonValue) MarshalJSON() ([]byte, error) {
 	stride := v.dim.NDim()
 	rings := make([][][]float64, len(v.rings))
 	for i, ring := range v.rings {
 		nVerts := len(ring) / stride
 		verts := make([][]float64, nVerts)
-		for vi := 0; vi < nVerts; vi++ {
+		for vi := range nVerts {
 			verts[vi] = ring[vi*stride : (vi+1)*stride]
 		}
 		rings[i] = verts
@@ -117,8 +108,8 @@ func (v PolygonValue) MarshalJSON() ([]byte, error) {
 	return json.Marshal(rings)
 }
 
-// PolygonType is the extension type for Polygon geometries.
-// Storage: List<List<Struct<x: double, y: double, [z: double, [m: double]]>>>
+// PolygonType is the GeoArrow extension type for Polygon geometries
+// (geoarrow.polygon). Storage is List<rings: List<vertices: Coord>>.
 type PolygonType struct {
 	arrow.ExtensionBase
 	Extension
@@ -126,31 +117,48 @@ type PolygonType struct {
 
 type polygonOption func(*PolygonType)
 
+// PolygonWithStorage overrides the Arrow storage type. Use when constructing
+// a PolygonType with non-default field names or a custom coord storage.
 func PolygonWithStorage(storage arrow.DataType) polygonOption {
 	return func(pt *PolygonType) {
 		pt.Storage = storage
 	}
 }
 
+// PolygonWithMetadata replaces the GeoArrow metadata on the type.
 func PolygonWithMetadata(metadata Metadata) polygonOption {
 	return func(pt *PolygonType) {
 		pt.meta = metadata
 	}
 }
 
+// polygonNesting names the List layers in polygon storage from outside in.
+var polygonNesting = []string{"rings", "vertices"}
+
 func polygonStorage(coordType arrow.DataType) arrow.DataType {
-	verticesList := arrow.ListOfField(arrow.Field{Name: "vertices", Type: coordType, Nullable: false})
-	return arrow.ListOfField(arrow.Field{Name: "rings", Type: verticesList, Nullable: false})
+	return nestedListStorage(coordType, polygonNesting...)
 }
 
 func defaultPolygonStorage() arrow.DataType {
-	coordStruct := arrow.StructOf(
-		arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
-		arrow.Field{Name: "y", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
-	)
-	return polygonStorage(coordStruct)
+	return polygonStorage(coordStructStorage(XY))
 }
 
+// PolygonWithDimension uses separated struct coord storage for the given dim.
+func PolygonWithDimension(dim Dimension) polygonOption {
+	return func(pt *PolygonType) {
+		pt.Storage = polygonStorage(coordStructStorage(dim))
+	}
+}
+
+// PolygonWithInterleaved uses interleaved FSL coord storage for the given dim.
+func PolygonWithInterleaved(dim Dimension) polygonOption {
+	return func(pt *PolygonType) {
+		pt.Storage = polygonStorage(interleavedStorage(dim))
+	}
+}
+
+// NewPolygonType constructs a PolygonType with the given options. The default
+// storage is separated XY Struct coords nested under "rings" / "vertices".
 func NewPolygonType(opts ...polygonOption) *PolygonType {
 	pt := &PolygonType{
 		ExtensionBase: arrow.ExtensionBase{Storage: defaultPolygonStorage()},
@@ -173,6 +181,13 @@ func (*PolygonType) Deserialize(storageType arrow.DataType, data string) (arrow.
 	if err := json.Unmarshal([]byte(data), &meta); err != nil {
 		return nil, err
 	}
+	coordType, err := unwrapNestedLists(storageType, len(polygonNesting))
+	if err != nil {
+		return nil, fmt.Errorf("geoarrow.polygon: %w", err)
+	}
+	if _, err := checkCoordStorage(coordType); err != nil {
+		return nil, fmt.Errorf("geoarrow.polygon: %w", err)
+	}
 	return NewPolygonType(PolygonWithStorage(storageType), PolygonWithMetadata(meta)), nil
 }
 
@@ -191,15 +206,15 @@ func (pt *PolygonType) ExtensionEquals(other arrow.ExtensionType) bool {
 }
 
 func (*PolygonType) ArrayType() reflect.Type {
-	return reflect.TypeOf(PolygonArray{})
+	return reflect.TypeFor[PolygonArray]()
 }
 
-// coordStructFromStorage extracts the coordinate struct type from the
-// nested List<List<Struct>> polygon storage type.
-func coordStructFromStorage(storage arrow.DataType) *arrow.StructType {
-	outerList := storage.(*arrow.ListType)
-	innerList := outerList.ElemField().Type.(*arrow.ListType)
-	return innerList.ElemField().Type.(*arrow.StructType)
+// polygonCoordStorage returns the coord storage at the bottom of the nested
+// List<List<Coord>>. Only safe to call after Deserialize / construction has
+// validated the storage shape.
+func polygonCoordStorage(storage arrow.DataType) arrow.DataType {
+	coord, _ := unwrapNestedLists(storage, len(polygonNesting))
+	return coord
 }
 
 func (pt *PolygonType) valueFromArray(a array.ExtensionArray, i int) PolygonValue {
@@ -211,25 +226,15 @@ func (pt *PolygonType) valueFromArray(a array.ExtensionArray, i int) PolygonValu
 	ringStart, ringEnd := outerList.ValueOffsets(i)
 
 	innerList := outerList.ListValues().(*array.List)
-	structArr := innerList.ListValues().(*array.Struct)
+	coordArr := innerList.ListValues()
 
-	coordStruct := coordStructFromStorage(pt.StorageType())
-	nFields := coordStruct.NumFields()
-	dim := DimensionFromStructType(coordStruct)
+	dim := DimensionFromStorage(polygonCoordStorage(pt.StorageType()))
 	stride := dim.NDim()
 
 	rings := make([][]float64, ringEnd-ringStart)
 	for r := ringStart; r < ringEnd; r++ {
 		vertStart, vertEnd := innerList.ValueOffsets(int(r))
-		nVerts := int(vertEnd - vertStart)
-		coords := make([]float64, nVerts*stride)
-		for v := 0; v < nVerts; v++ {
-			idx := int(vertStart) + v
-			for f := 0; f < nFields; f++ {
-				coords[v*stride+f] = structArr.Field(f).(*array.Float64).Value(idx)
-			}
-		}
-		rings[r-ringStart] = coords
+		rings[r-ringStart] = readCoordsRange(coordArr, int(vertStart), int(vertEnd), stride)
 	}
 
 	return PolygonValue{rings: rings, dim: dim}
@@ -240,164 +245,70 @@ func (pt *PolygonType) appendValueToBuilder(b array.Builder, v PolygonValue) {
 	outerListBuilder.Append(true)
 
 	innerListBuilder := outerListBuilder.ValueBuilder().(*array.ListBuilder)
-	structBuilder := innerListBuilder.ValueBuilder().(*array.StructBuilder)
+	coordBuilder := innerListBuilder.ValueBuilder()
 
-	coordStruct := coordStructFromStorage(pt.StorageType())
-	nFields := coordStruct.NumFields()
 	stride := v.dim.NDim()
-
 	for _, ring := range v.rings {
 		innerListBuilder.Append(true)
-		nVerts := len(ring) / stride
-		for vi := 0; vi < nVerts; vi++ {
-			structBuilder.Append(true)
-			for f := 0; f < nFields; f++ {
-				structBuilder.FieldBuilder(f).(*array.Float64Builder).Append(ring[vi*stride+f])
-			}
-		}
+		appendCoords(coordBuilder, ring, stride)
 	}
 }
 
 func (pt *PolygonType) valueFromString(s string) (PolygonValue, error) {
-	s = strings.TrimSpace(s)
-	upper := strings.ToUpper(s)
-	if !strings.HasPrefix(upper, "POLYGON") {
-		return PolygonValue{}, fmt.Errorf("invalid polygon WKT: %s", s)
+	prefix, body, isEmpty, err := wktSplit(s, "POLYGON")
+	if err != nil {
+		return PolygonValue{}, err
 	}
-
-	if strings.Contains(upper, "EMPTY") {
+	if isEmpty {
 		return PolygonValue{}, nil
 	}
 
-	// Determine dimension from prefix before first '('
-	firstParen := strings.Index(s, "(")
-	if firstParen == -1 {
-		return PolygonValue{}, fmt.Errorf("invalid polygon WKT: missing '(': %s", s)
+	ringStrs, err := splitTopLevelGroups(body)
+	if err != nil {
+		return PolygonValue{}, fmt.Errorf("polygon WKT: %w", err)
 	}
-	prefix := strings.ToUpper(strings.TrimSpace(s[:firstParen]))
-
-	// Strip "POLYGON" prefix and outer parens
-	body := strings.TrimSpace(s[firstParen:])
-	if !strings.HasPrefix(body, "(") || !strings.HasSuffix(body, ")") {
-		return PolygonValue{}, fmt.Errorf("invalid polygon WKT: %s", s)
-	}
-	body = body[1 : len(body)-1] // remove outer ( )
-
-	// Split rings by "),(" pattern
-	var ringStrs []string
-	depth := 0
-	start := 0
-	for i, ch := range body {
-		switch ch {
-		case '(':
-			if depth == 0 {
-				start = i + 1
-			}
-			depth++
-		case ')':
-			depth--
-			if depth == 0 {
-				ringStrs = append(ringStrs, body[start:i])
-			}
+	rings := make([][]float64, 0, len(ringStrs))
+	dim := XY
+	for i, ringStr := range ringStrs {
+		coords, stride, err := parseWKTFlatCoords(ringStr)
+		if err != nil {
+			return PolygonValue{}, fmt.Errorf("polygon WKT: %w", err)
 		}
-	}
-
-	var rings [][]float64
-	var detectedDim Dimension
-	for _, ringStr := range ringStrs {
-		parts := strings.Split(ringStr, ",")
-		var coords []float64
-		for _, part := range parts {
-			fields := strings.Fields(strings.TrimSpace(part))
-			if detectedDim == 0 && len(rings) == 0 && len(coords) == 0 {
-				switch len(fields) {
-				case 2:
-					detectedDim = XY
-				case 3:
-					if strings.Contains(prefix, "M") && !strings.Contains(prefix, "ZM") {
-						detectedDim = XYM
-					} else {
-						detectedDim = XYZ
-					}
-				case 4:
-					detectedDim = XYZM
-				}
-			}
-			for _, f := range fields {
-				val, err := strconv.ParseFloat(f, 64)
-				if err != nil {
-					return PolygonValue{}, fmt.Errorf("invalid coordinate in polygon WKT: %s", f)
-				}
-				coords = append(coords, val)
+		if i == 0 {
+			dim, err = dimFromWKTPrefix(prefix, stride)
+			if err != nil {
+				return PolygonValue{}, fmt.Errorf("polygon WKT: %w", err)
 			}
 		}
 		rings = append(rings, coords)
 	}
 
-	return PolygonValue{rings: rings, dim: detectedDim}, nil
+	return PolygonValue{rings: rings, dim: dim}, nil
 }
 
 func (pt *PolygonType) unmarshalJSONOne(dec *json.Decoder) (PolygonValue, bool, error) {
-	t, err := dec.Token()
+	isNull, err := decodeOpenOrNull(dec)
 	if err != nil {
 		return PolygonValue{}, false, err
 	}
-
-	if t == nil {
+	if isNull {
 		return PolygonValue{}, true, nil
 	}
 
-	// Expect '[' for array of rings
-	delim, ok := t.(json.Delim)
-	if !ok || delim != '[' {
-		return PolygonValue{}, false, fmt.Errorf("expected '[' for Polygon value, got %T(%v)", t, t)
-	}
-
-	coordStruct := coordStructFromStorage(pt.StorageType())
-	dim := DimensionFromStructType(coordStruct)
-	stride := dim.NDim()
+	dim := DimensionFromStorage(polygonCoordStorage(pt.StorageType()))
 
 	var rings [][]float64
 	for dec.More() {
-		// Each ring is an array of coordinate arrays
-		ringTok, err := dec.Token()
+		if err := expectDelim(dec, '['); err != nil {
+			return PolygonValue{}, false, fmt.Errorf("polygon ring: %w", err)
+		}
+		ring, err := decodeCoordList(dec)
 		if err != nil {
 			return PolygonValue{}, false, err
 		}
-		if d, ok := ringTok.(json.Delim); !ok || d != '[' {
-			return PolygonValue{}, false, fmt.Errorf("expected '[' for ring, got %T(%v)", ringTok, ringTok)
-		}
-
-		var coords []float64
-		for dec.More() {
-			// Each vertex is [x, y, ...]
-			vertTok, err := dec.Token()
-			if err != nil {
-				return PolygonValue{}, false, err
-			}
-			if d, ok := vertTok.(json.Delim); !ok || d != '[' {
-				return PolygonValue{}, false, fmt.Errorf("expected '[' for vertex, got %T(%v)", vertTok, vertTok)
-			}
-			for ci := 0; ci < stride; ci++ {
-				var f float64
-				if err := dec.Decode(&f); err != nil {
-					return PolygonValue{}, false, err
-				}
-				coords = append(coords, f)
-			}
-			// consume vertex ']'
-			if _, err := dec.Token(); err != nil {
-				return PolygonValue{}, false, err
-			}
-		}
-		// consume ring ']'
-		if _, err := dec.Token(); err != nil {
-			return PolygonValue{}, false, err
-		}
-		rings = append(rings, coords)
+		rings = append(rings, ring)
 	}
-	// consume outer ']'
-	if _, err := dec.Token(); err != nil {
+	if _, err := dec.Token(); err != nil { // outer ']'
 		return PolygonValue{}, false, err
 	}
 
@@ -410,7 +321,10 @@ func (pt *PolygonType) NewBuilder(mem memory.Allocator) array.Builder {
 	}
 }
 
+// PolygonArray is the Arrow ExtensionArray for geoarrow.polygon.
 type PolygonArray = geometryArray[PolygonValue, *PolygonType]
+
+// PolygonBuilder is the Arrow Builder for geoarrow.polygon.
 type PolygonBuilder = valueBuilder[PolygonValue, *PolygonType]
 
 var _ array.CustomExtensionBuilder = (*PolygonType)(nil)

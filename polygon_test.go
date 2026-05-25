@@ -322,6 +322,79 @@ func TestPolygonValuesMethod(t *testing.T) {
 	require.Equal(t, 2, values[1].NumRings())
 }
 
+func TestPolygonInterleavedRoundTrip(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	for _, dim := range []geoarrow.Dimension{geoarrow.XY, geoarrow.XYZ, geoarrow.XYM, geoarrow.XYZM} {
+		t.Run(dim.String(), func(t *testing.T) {
+			typ := geoarrow.NewPolygonType(geoarrow.PolygonWithInterleaved(dim))
+
+			// Build a tiny triangle with the requested dimension.
+			stride := dim.NDim()
+			ring := make([]float64, 0, 4*stride)
+			for _, xy := range [][2]float64{{0, 0}, {1, 0}, {0, 1}, {0, 0}} {
+				ring = append(ring, xy[0], xy[1])
+				for k := 2; k < stride; k++ {
+					ring = append(ring, float64(k))
+				}
+			}
+			poly := geoarrow.NewPolygonValue(dim, [][]float64{ring})
+
+			builder := typ.NewBuilder(mem).(*geoarrow.PolygonBuilder)
+			defer builder.Release()
+			builder.Append(poly)
+			builder.AppendNull()
+
+			arr := builder.NewArray()
+			defer arr.Release()
+
+			require.Equal(t, 2, arr.Len())
+			require.Equal(t, 1, arr.NullN())
+
+			polyArr := arr.(*geoarrow.PolygonArray)
+			got := polyArr.Value(0)
+			require.Equal(t, dim, got.Dimension())
+			require.Equal(t, 1, got.NumRings())
+			require.Equal(t, 4, got.NumVertices(0))
+			require.Equal(t, ring, got.Ring(0))
+
+			deserialized, err := typ.Deserialize(typ.StorageType(), typ.Serialize())
+			require.NoError(t, err)
+			require.True(t, typ.ExtensionEquals(deserialized))
+
+			builder2 := typ.NewBuilder(mem).(*geoarrow.PolygonBuilder)
+			defer builder2.Release()
+			for i := 0; i < arr.Len(); i++ {
+				require.NoError(t, builder2.AppendValueFromString(arr.ValueStr(i)))
+			}
+			arr2 := builder2.NewArray()
+			defer arr2.Release()
+			require.True(t, array.Equal(arr, arr2))
+
+			jsonData, err := json.Marshal(arr)
+			require.NoError(t, err)
+			arr3, _, err := array.FromJSON(mem, typ, bytes.NewReader(jsonData))
+			require.NoError(t, err)
+			defer arr3.Release()
+			require.True(t, array.Equal(arr, arr3))
+		})
+	}
+}
+
+func TestPolygonDeserializeRejectsBadStorage(t *testing.T) {
+	typ := geoarrow.NewPolygonType()
+
+	// Not a list at all.
+	_, err := typ.Deserialize(arrow.PrimitiveTypes.Float64, "{}")
+	require.Error(t, err)
+
+	// Outer list but inner is not a list.
+	bad := arrow.ListOfField(arrow.Field{Name: "rings", Type: arrow.PrimitiveTypes.Float64})
+	_, err = typ.Deserialize(bad, "{}")
+	require.Error(t, err)
+}
+
 func TestPolygonMarshalJSON(t *testing.T) {
 	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
 	defer mem.AssertSize(t, 0)
