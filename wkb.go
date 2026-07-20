@@ -10,6 +10,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/schema"
 )
 
 type WKBType struct {
@@ -116,6 +117,19 @@ func NewWKBType(opts ...wkbOption) *WKBType {
 
 func (*WKBType) ExtensionName() string {
 	return ExtensionNameWKB
+}
+
+// ParquetLogicalType lets a downstream Parquet writer that looks for this interface
+// write WKB as the naive Parquet GEOMETRY or GEOGRAPHY logical type, depending on
+// GeoArrow metadata.
+func (wkb *WKBType) ParquetLogicalType() schema.LogicalType {
+	if wkb.meta.Edges != "" {
+		return schema.GeographyLogicalType{
+			Algorithm: schema.GeographyEdgeInterpolationAlgorithm(wkb.meta.Edges),
+			Crs:       string(wkb.meta.CRS),
+		}
+	}
+	return schema.GeometryLogicalType{Crs: string(wkb.meta.CRS)}
 }
 
 func (*WKBType) Deserialize(storageType arrow.DataType, data string) (arrow.ExtensionType, error) {

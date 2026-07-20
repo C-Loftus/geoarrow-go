@@ -43,6 +43,17 @@ func TestE2EWriteArrowToParquetGeography(t *testing.T) {
 	})
 }
 
+func TestParquetLogicalTypeOnlyAppliesToWKB(t *testing.T) {
+	_, ok := any(geoarrow.NewWKBType()).(pqarrow.ExtensionCustomParquetType)
+	require.True(t, ok)
+
+	_, ok = any(geoarrow.NewPointType()).(pqarrow.ExtensionCustomParquetType)
+	require.False(t, ok)
+
+	_, ok = any(geoarrow.NewPolygonType()).(pqarrow.ExtensionCustomParquetType)
+	require.False(t, ok)
+}
+
 func newFiveRowWKBRecord(t *testing.T, mem memory.Allocator, typ *geoarrow.WKBType) arrow.RecordBatch {
 	builder := typ.NewBuilder(mem).(*geoarrow.WKBBuilder)
 	defer builder.Release()
