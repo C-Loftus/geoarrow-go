@@ -3,6 +3,7 @@ package geoarrow
 import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/parquet/schema"
 	json "github.com/goccy/go-json"
 )
 
@@ -30,6 +31,7 @@ func init() {
 // format and encoding.
 type GeometryType[V GeometryValue] interface {
 	arrow.ExtensionType
+	ParquetLogicalType() schema.LogicalType
 	valueFromArray(a array.ExtensionArray, i int) V
 	appendValueToBuilder(b array.Builder, v V)
 	valueFromString(s string) (V, error)
@@ -59,6 +61,21 @@ func (e *Extension) Serialize() string {
 	// serialize successfully
 	serialized, _ := json.Marshal(e.meta)
 	return string(serialized)
+}
+
+// ParquetLogicalType lets Parquet conversion treat this extension as a logical type on write;
+// In this case, the extension type will be registered as either a Geometry or Geography logical type
+// for Parquet depending on the metadata
+func (e *Extension) ParquetLogicalType() schema.LogicalType {
+	// If there is an edge interpolation, this is a Geography type
+	if e.meta.Edges != "" {
+		return schema.GeographyLogicalType{
+			Algorithm: schema.GeographyEdgeInterpolationAlgorithm(e.meta.Edges),
+			Crs:       string(e.meta.CRS),
+		}
+	}
+	return schema.GeometryLogicalType{
+		Crs: string(e.meta.CRS)}
 }
 
 // Equal compares two Extension instances for equality based on their metadata.
