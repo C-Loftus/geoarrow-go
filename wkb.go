@@ -119,7 +119,7 @@ func (*WKBType) ExtensionName() string {
 	return ExtensionNameWKB
 }
 
-// ParquetLogicalType lets a downstream Parquet writer that looks for this interface
+// ParquetLogicalType lets a downstream Parquet writer that looks for this interface method
 // write WKB as the naive Parquet GEOMETRY or GEOGRAPHY logical type, depending on
 // GeoArrow metadata.
 func (wkb *WKBType) ParquetLogicalType() schema.LogicalType {
