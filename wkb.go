@@ -10,6 +10,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/apache/arrow-go/v18/parquet/schema"
 )
 
@@ -126,10 +127,76 @@ func (wkb *WKBType) ParquetLogicalType() schema.LogicalType {
 	if wkb.meta.Edges != "" {
 		return schema.GeographyLogicalType{
 			Algorithm: schema.GeographyEdgeInterpolationAlgorithm(wkb.meta.Edges),
-			Crs:       string(wkb.meta.CRS),
+			Crs:       wkb.meta.ParquetCRS(),
 		}
 	}
-	return schema.GeometryLogicalType{Crs: string(wkb.meta.CRS)}
+	return schema.GeometryLogicalType{Crs: wkb.meta.ParquetCRS()}
+}
+
+// ArrowTypeFromParquet maps Parquet GEOMETRY and GEOGRAPHY logical byte-array
+// columns back to the GeoArrow WKB extension type, allowing read support for the extension
+func (*WKBType) ArrowTypeFromParquet(logical schema.LogicalType, storageType arrow.DataType) (arrow.ExtensionType, error) {
+	if storageType == nil {
+		return nil, nil
+	}
+
+	// WKB is represented as variable-width bytes. Other Parquet physical
+	// storage cannot safely be interpreted as this extension type.
+	var storageOpt wkbOption
+	switch storageType.ID() {
+	case arrow.BINARY:
+		storageOpt = WKBWithBinaryStorage()
+	case arrow.LARGE_BINARY:
+		storageOpt = WKBWithLargeBinaryStorage()
+	default:
+		return nil, nil
+	}
+
+	// Preserve CRS and edge interpolation metadata encoded in the Parquet
+	// logical type so schema conversion is reversible where possible.
+	meta := NewMetadata()
+	switch logical := logical.(type) {
+	case schema.GeometryLogicalType:
+		if logical.IsCRSSet() {
+			meta.SetCRSString(logical.CRS())
+		}
+	case schema.GeographyLogicalType:
+		if logical.IsCRSSet() {
+			meta.SetCRSString(logical.CRS())
+		}
+		edges, ok := edgeInterpolationFromParquet(logical.EdgeInterpolationAlgorithm())
+		if !ok {
+			return nil, fmt.Errorf("unsupported Parquet geography edge interpolation algorithm: %s", logical.EdgeInterpolationAlgorithm())
+		}
+		meta.Edges = edges
+	default:
+		return nil, nil
+	}
+
+	// Return a new type instead of the registered receiver so the storage type
+	// and metadata match the Parquet column being converted.
+	return NewWKBType(storageOpt, WKBWithMetadata(meta)), nil
+}
+
+// edgeInterpolationFromParquet maps Parquet geography edge interpolation values
+// to GeoArrow metadata values. This is semantically the same but is mapped
+// explicitly to ensure there is no implicit usage of unknown/typo values and things
+// are kept in sync between geoarrow-go and arrow-go
+func edgeInterpolationFromParquet(alg schema.GeographyEdgeInterpolationAlgorithm) (EdgeInterpolation, bool) {
+	switch alg {
+	case schema.GeographyEdgeSpherical:
+		return EdgeSpherical, true
+	case schema.GeographyEdgeVincenty:
+		return EdgeVincenty, true
+	case schema.GeographyEdgeThomas:
+		return EdgeThomas, true
+	case schema.GeographyEdgeAndoyer:
+		return EdgeAndoyer, true
+	case schema.GeographyEdgeKarney:
+		return EdgeKarney, true
+	default:
+		return "", false
+	}
 }
 
 func (*WKBType) Deserialize(storageType arrow.DataType, data string) (arrow.ExtensionType, error) {
@@ -228,3 +295,11 @@ type WKBBuilder = valueBuilder[WKBBytes, *WKBType]
 var _ arrow.ExtensionType = (*WKBType)(nil)
 var _ array.ExtensionArray = (*WKBArray)(nil)
 var _ array.CustomExtensionBuilder = (*WKBType)(nil)
+
+// ExtensionCustomParquetType is the interface used by writers to specify when which
+// logical type in Parquet to use to represent the extension type.
+var _ pqarrow.ExtensionCustomParquetType = (*WKBType)(nil)
+
+// ExtensionCustomArrowReadType is the interface used by readers to specify how to
+// convert an associated Parquet LogicalType back to an Arrow ExtensionType.
+var _ pqarrow.ExtensionCustomArrowReadType = (*WKBType)(nil)
